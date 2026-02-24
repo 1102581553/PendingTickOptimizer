@@ -46,6 +46,25 @@ ll::io::Logger& logger() {
     return *log;
 }
 
+// ── 工具函数：检查队列是否全是 portal tick ────────────────
+
+static bool isPortalOnlyQueue(BlockTickingQueue::TickDataSet const& queue) {
+    bool hasPortal = false;
+    for (auto const& blockTick : queue.mC) {
+        if (blockTick.mIsRemoved) continue;
+        if (!blockTick.mData.mBlock) continue;
+        auto name = blockTick.mData.mBlock->getTypeName();
+        if (name == "minecraft:portal" ||
+            name == "minecraft:end_portal" ||
+            name == "minecraft:end_gateway") {
+            hasPortal = true;
+        } else {
+            return false; // 有非 portal 方块，放行
+        }
+    }
+    return hasPortal;
+}
+
 // ── Hook ──────────────────────────────────────────────────
 
 LL_TYPE_INSTANCE_HOOK(
@@ -77,49 +96,50 @@ LL_TYPE_INSTANCE_HOOK(
     int          max,
     bool         instaTick_
 ) {
-    if (!pluginEnabled.load(std::memory_order_relaxed) || !config.enabled) {
+    if (!pluginEnabled.load(std::memory_order_relaxed) || !config.enabled || !config.budgetEnabled) {
+        return origin(region, until, max, instaTick_);
+    }
+
+    // 非纯 portal 队列直接放行，零开销
+    if (!isPortalOnlyQueue(this->mNextTickQueue.mC)) {
         return origin(region, until, max, instaTick_);
     }
 
     totalCallCount.fetch_add(1, std::memory_order_relaxed);
 
-    if (config.budgetEnabled) {
-        // 单次调用限制
-        if (max > config.budgetPerTick) {
-            max = config.budgetPerTick;
-        }
+    // 单次调用限制
+    if (max > config.budgetPerTick) {
+        max = config.budgetPerTick;
+    }
 
-        // 全局预算限制
-        int remaining = gTickBudgetRemaining.load(std::memory_order_relaxed);
+    // 全局预算限制
+    int remaining = gTickBudgetRemaining.load(std::memory_order_relaxed);
+    if (remaining <= 0) {
+        totalCapped.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    int allowed = std::min(max, remaining);
+    while (!gTickBudgetRemaining.compare_exchange_weak(
+        remaining,
+        remaining - allowed,
+        std::memory_order_relaxed,
+        std::memory_order_relaxed
+    )) {
         if (remaining <= 0) {
             totalCapped.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
-
-        int allowed = std::min(max, remaining);
-        while (!gTickBudgetRemaining.compare_exchange_weak(
-            remaining,
-            remaining - allowed,
-            std::memory_order_relaxed,
-            std::memory_order_relaxed
-        )) {
-            if (remaining <= 0) {
-                totalCapped.fetch_add(1, std::memory_order_relaxed);
-                return false;
-            }
-            allowed = std::min(max, remaining);
-        }
-
-        auto queueSize = static_cast<uint64_t>(this->mNextTickQueue->mC.size());
-        totalQueued.fetch_add(queueSize, std::memory_order_relaxed);
-
-        if (allowed < max) {
-            totalCapped.fetch_add(1, std::memory_order_relaxed);
-        }
-        max = allowed;
+        allowed = std::min(max, remaining);
     }
 
-    return origin(region, until, max, instaTick_);
+    totalQueued.fetch_add(this->mNextTickQueue.mC.size(), std::memory_order_relaxed);
+
+    if (allowed < max) {
+        totalCapped.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    return origin(region, until, max, allowed);
 }
 
 // ── 统计输出协程 ──────────────────────────────────────────
@@ -142,7 +162,7 @@ void startStatsTask() {
                     : 0.0f;
 
                 logger().info(
-                    "PendingTicks | calls: {} | avg queue: {:.1f} | capped: {} ({:.1f}%)",
+                    "PortalTicks | calls: {} | avg queue: {:.1f} | capped: {} ({:.1f}%)",
                     calls,
                     calls > 0 ? static_cast<float>(queued) / static_cast<float>(calls) : 0.0f,
                     capped,
