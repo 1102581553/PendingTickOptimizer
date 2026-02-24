@@ -13,8 +13,9 @@ struct Config {
     bool debug            = false;
     int  statsIntervalSec = 5;
 
-    bool budgetEnabled = true;
-    int  budgetPerTick = 100; // 每 tick 全服最多处理 N 个计划刻
+    bool budgetEnabled      = true;
+    int  budgetPerTick      = 100; // 单次调用最多处理 N 个计划刻
+    int  globalBudgetPerTick = 300; // 每 tick 全服总计最多处理 N 个计划刻
 };
 
 Config&         getConfig();
