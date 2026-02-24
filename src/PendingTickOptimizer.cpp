@@ -56,7 +56,7 @@ LL_TYPE_INSTANCE_HOOK(
     LevelTickHook,
     ll::memory::HookPriority::Normal,
     Level,
-    &Level::tick,
+    &Level::$tick,,
     void
 ) {
     if (pluginEnabled.load(std::memory_order_relaxed)
