@@ -20,10 +20,7 @@ static std::shared_ptr<ll::io::Logger> log;
 static std::atomic<bool>               pluginEnabled{false};
 static std::atomic<bool>               hookInstalled{false};
 
-// 全局预算：每 tick 由 LevelTickHook 重置，由 PendingTicksHook 消耗
-static std::atomic<int> gTickBudgetRemaining{0};
-
-// 统计
+static std::atomic<int>      gTickBudgetRemaining{0};
 static std::atomic<uint64_t> totalCallCount{0};
 static std::atomic<uint64_t> totalQueued{0};
 static std::atomic<uint64_t> totalCapped{0};
@@ -51,7 +48,6 @@ ll::io::Logger& logger() {
 
 // ── Hook ──────────────────────────────────────────────────
 
-// Level::tick 在每 tick 最开始执行，用于重置全局预算
 LL_TYPE_INSTANCE_HOOK(
     LevelTickHook,
     ll::memory::HookPriority::Normal,
@@ -63,7 +59,7 @@ LL_TYPE_INSTANCE_HOOK(
         && config.enabled
         && config.budgetEnabled) {
         gTickBudgetRemaining.store(
-            std::max(1, config.budgetPerTick),
+            std::max(1, config.globalBudgetPerTick),
             std::memory_order_relaxed
         );
     }
@@ -88,17 +84,19 @@ LL_TYPE_INSTANCE_HOOK(
     totalCallCount.fetch_add(1, std::memory_order_relaxed);
 
     if (config.budgetEnabled) {
-        // 原子地从全局预算中申请配额
-        // fetch_sub 返回旧值，用旧值来判断本次能拿到多少
+        // 单次调用限制
+        if (max > config.budgetPerTick) {
+            max = config.budgetPerTick;
+        }
+
+        // 全局预算限制
         int remaining = gTickBudgetRemaining.load(std::memory_order_relaxed);
         if (remaining <= 0) {
-            // 预算已耗尽，跳过本次处理
             totalCapped.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
 
         int allowed = std::min(max, remaining);
-        // CAS 循环保证原子扣减正确
         while (!gTickBudgetRemaining.compare_exchange_weak(
             remaining,
             remaining - allowed,
@@ -167,4 +165,59 @@ PluginImpl& PluginImpl::getInstance() {
 }
 
 bool PluginImpl::load() {
-    std::filesystem::create_directories(getSelf().getConfigDir())
+    std::filesystem::create_directories(getSelf().getConfigDir());
+    if (!loadConfig()) {
+        logger().warn("Failed to load config, saving defaults");
+        saveConfig();
+    }
+    logger().info(
+        "Loaded. budget={}(per={}, global={})",
+        config.budgetEnabled,
+        config.budgetPerTick,
+        config.globalBudgetPerTick
+    );
+    return true;
+}
+
+bool PluginImpl::enable() {
+    pluginEnabled.store(true, std::memory_order_relaxed);
+
+    totalCallCount.store(0, std::memory_order_relaxed);
+    totalQueued.store(0, std::memory_order_relaxed);
+    totalCapped.store(0, std::memory_order_relaxed);
+    gTickBudgetRemaining.store(0, std::memory_order_relaxed);
+
+    if (!hookInstalled.load(std::memory_order_relaxed)) {
+        LevelTickHook::hook();
+        PendingTicksHook::hook();
+        hookInstalled.store(true, std::memory_order_relaxed);
+        logger().info("Hooks installed");
+    }
+
+    startStatsTask();
+    logger().info(
+        "Enabled. budget={}(per={}, global={})",
+        config.budgetEnabled,
+        config.budgetPerTick,
+        config.globalBudgetPerTick
+    );
+    return true;
+}
+
+bool PluginImpl::disable() {
+    pluginEnabled.store(false, std::memory_order_relaxed);
+
+    if (hookInstalled.load(std::memory_order_relaxed)) {
+        LevelTickHook::unhook();
+        PendingTicksHook::unhook();
+        hookInstalled.store(false, std::memory_order_relaxed);
+        logger().info("Hooks uninstalled");
+    }
+
+    logger().info("Disabled");
+    return true;
+}
+
+} // namespace pending_tick_optimizer
+
+LL_REGISTER_MOD(pending_tick_optimizer::PluginImpl, pending_tick_optimizer::PluginImpl::getInstance());
